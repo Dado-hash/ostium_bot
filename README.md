@@ -1,4 +1,22 @@
-# Ostium Bot Setup Guide
+# Ostium Telegram Bot
+
+## Descrizione
+
+Questo bot Telegram monitora in tempo reale l'attività di trading di un wallet Ostium specifico e invia notifiche dettagliate agli utenti iscritti.
+
+### Funzionalità principali:
+
+- **Monitoraggio automatico**: Controlla ogni 60 secondi le posizioni aperte sul wallet target
+- **Notifiche in tempo reale**:
+  - 🚨 **Nuove operazioni**: Avviso quando viene aperta una nuova posizione
+  - ❌ **Chiusura operazioni**: Notifica quando una posizione viene chiusa
+  - ⚠️ **Modifiche**: Alerta quando il collaterale di una posizione cambia (chiusure parziali o aggiunte di margine)
+- **Iscrizioni multiple**: Supporta più utenti contemporaneamente tramite comandi `/start` e `/stop`
+- **Stato iniziale**: Mostra le posizioni attualmente aperte quando un utente si iscrive con `/start`
+- **Dettagli completi**: Ogni notifica include coppia di trading, direzione (LONG/SHORT), prezzo di entrata, size, collaterale e leva finanziaria
+- **Persistenza**: Salva automaticamente l'elenco degli iscritti in `subscribers.json`
+
+## Setup Guide
 
 This guide will help you set up and run the Ostium Telegram Bot.
 This version supports multiple subscribers via `/start` and `/stop` commands.
