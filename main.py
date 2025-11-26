@@ -60,7 +60,7 @@ async def get_current_trades_dict(sdk):
         return current_trades
     except Exception as e:
         logger.error(f"Failed to fetch trades: {e}")
-        return {}
+        return None  # Return None to indicate failure, not empty dict
 
 def format_trade_message(trade, status="OPEN"):
     """Formats a trade dict into a readable string."""
@@ -131,7 +131,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sdk = OstiumSDK(config, PRIVATE_KEY, RPC_URL)
         trades = await get_current_trades_dict(sdk)
         
-        if not trades:
+        if trades is None:
+            await update.message.reply_text("⚠️ Could not fetch current positions at this moment. Will notify you of future trades.")
+        elif not trades:
             await update.message.reply_text("ℹ️ No open positions found for this wallet right now.")
         else:
             await update.message.reply_text(f"📊 **Current Open Positions ({len(trades)}):**", parse_mode='Markdown')
@@ -191,6 +193,12 @@ async def poll_ostium(application: Application):
         try:
             # Fetch open trades
             current_trades = await get_current_trades_dict(sdk)
+            
+            # Skip this cycle if fetch failed
+            if current_trades is None:
+                logger.warning("Skipping this polling cycle due to fetch error")
+                await asyncio.sleep(60)
+                continue
 
             if first_run:
                 logger.info(f"Initial check: Found {len(current_trades)} open trades.")
