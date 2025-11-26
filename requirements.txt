@@ -1,0 +1,3 @@
+ostium-python-sdk
+python-dotenv
+python-telegram-bot
