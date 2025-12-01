@@ -62,6 +62,36 @@ async def get_current_trades_dict(sdk):
         logger.error(f"Failed to fetch trades: {e}")
         return None  # Return None to indicate failure, not empty dict
 
+def format_trade_message(trade, status="OPEN", close_details=None):
+    """Formats a trade dict into a readable string."""
+    try:
+        # Extract Pair
+        pair_from = trade.get('pair', {}).get('from', 'Unknown')
+        pair_to = trade.get('pair', {}).get('to', 'USD')
+        pair_symbol = f"{pair_from}/{pair_to}"
+
+        # Extract and Scale Values
+        # USDC has 6 decimals
+        collateral_raw = float(trade.get('collateral', 0))
+        collateral_val = collateral_raw / 1e6
+        
+        notional_raw = float(trade.get('notional', 0))
+        size_val = notional_raw / 1e6
+
+        # Price usually has 18 decimals
+        open_price_raw = float(trade.get('openPrice', 0))
+        open_price_val = open_price_raw / 1e18
+
+        # Leverage: 2500 likely means 25.00x (2 decimals)
+        leverage_raw = float(trade.get('leverage', 0))
+        leverage_val = leverage_raw # Display raw first, user can correct if it looks wrong. 
+        # Actually, if collateral is 160k and size is 4M, leverage = 4M / 160k = 25.
+        # So 2500 raw = 25x. Thus we divide by 100.
+        leverage_val = leverage_raw / 100
+
+        is_long = trade.get('isBuy', True) # 'isBuy' from raw data
+        direction_str = "LONG 🟢" if is_long else "SHORT 🔴"
+
         if status == "OPEN":
             return (
                 f"🟢 **OPEN POSITION**\n"
