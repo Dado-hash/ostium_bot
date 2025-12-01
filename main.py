@@ -279,34 +279,55 @@ async def poll_ostium(application: Application):
 
                 # Check for CLOSED trades
                 closed_uids = []
+                used_history_ids = set() # Track matched history items to avoid duplicates
+                
+                # Fetch history once if there are closed trades
+                history = []
+                closed_trades_list = [t for uid, t in known_trades.items() if uid not in current_trades]
+                
+                if closed_trades_list:
+                    try:
+                        # Fetch recent history
+                        # Increase last_n_orders to ensure we catch multiple simultaneous closes
+                        history = await sdk.subgraph.get_recent_history(TARGET_WALLET, last_n_orders=20)
+                    except Exception as e:
+                        logger.error(f"Failed to fetch history for closed trades: {e}")
+
                 for uid, trade in known_trades.items():
                     if uid not in current_trades:
                         # Trade is CLOSED
-                        logger.info(f"Trade {uid} closed. Fetching history for details...")
+                        logger.info(f"Trade {uid} closed. finding details...")
                         
                         close_details = None
-                        try:
-                            # Fetch recent history to find the close details
-                            history = await sdk.subgraph.get_recent_history(TARGET_WALLET, last_n_orders=5)
-                            
-                            # Find the matching close order
-                            # We match by Pair ID and ensure it's a 'Close' action
-                            # We also check if it's recent (e.g. within last 5 minutes) to avoid stale matches
-                            # though polling is every 60s so it should be the top one.
-                            
+                        
+                        if history:
                             trade_pair_id = trade.get('pair', {}).get('id')
+                            trade_collateral = float(trade.get('collateral', 0))
+                            
+                            best_match = None
+                            min_diff = float('inf')
                             
                             for item in history:
+                                # Skip if already matched to another trade in this batch
+                                if item.get('id') in used_history_ids:
+                                    continue
+                                    
                                 if (item.get('pair', {}).get('id') == trade_pair_id and 
                                     item.get('orderAction') == 'Close'):
-                                    # Found a candidate.
-                                    # In a high frequency scenario we might need more checks (like index),
-                                    # but for this wallet/frequency, this should be sufficient.
-                                    close_details = item
-                                    break
                                     
-                        except Exception as e:
-                            logger.error(f"Failed to fetch history for closed trade {uid}: {e}")
+                                    # Match by Collateral (within 1 USDC tolerance)
+                                    # 1 USDC = 1,000,000 units
+                                    hist_collateral = float(item.get('collateral', 0))
+                                    diff = abs(hist_collateral - trade_collateral)
+                                    
+                                    if diff < 1000000: 
+                                        if diff < min_diff:
+                                            min_diff = diff
+                                            best_match = item
+                            
+                            if best_match:
+                                close_details = best_match
+                                used_history_ids.add(best_match.get('id'))
 
                         # Format message with optional details
                         msg = format_trade_message(trade, status="CLOSED", close_details=close_details)
