@@ -62,36 +62,6 @@ async def get_current_trades_dict(sdk):
         logger.error(f"Failed to fetch trades: {e}")
         return None  # Return None to indicate failure, not empty dict
 
-def format_trade_message(trade, status="OPEN"):
-    """Formats a trade dict into a readable string."""
-    try:
-        # Extract Pair
-        pair_from = trade.get('pair', {}).get('from', 'Unknown')
-        pair_to = trade.get('pair', {}).get('to', 'USD')
-        pair_symbol = f"{pair_from}/{pair_to}"
-
-        # Extract and Scale Values
-        # USDC has 6 decimals
-        collateral_raw = float(trade.get('collateral', 0))
-        collateral_val = collateral_raw / 1e6
-        
-        notional_raw = float(trade.get('notional', 0))
-        size_val = notional_raw / 1e6
-
-        # Price usually has 18 decimals
-        open_price_raw = float(trade.get('openPrice', 0))
-        open_price_val = open_price_raw / 1e18
-
-        # Leverage: 2500 likely means 25.00x (2 decimals)
-        leverage_raw = float(trade.get('leverage', 0))
-        leverage_val = leverage_raw # Display raw first, user can correct if it looks wrong. 
-        # Actually, if collateral is 160k and size is 4M, leverage = 4M / 160k = 25.
-        # So 2500 raw = 25x. Thus we divide by 100.
-        leverage_val = leverage_raw / 100
-
-        is_long = trade.get('isBuy', True) # 'isBuy' from raw data
-        direction_str = "LONG 🟢" if is_long else "SHORT 🔴"
-        
         if status == "OPEN":
             return (
                 f"🟢 **OPEN POSITION**\n"
@@ -103,6 +73,40 @@ def format_trade_message(trade, status="OPEN"):
                 f"**Leverage:** {leverage_val:.2f}x\n"
                 f"**Wallet:** `{TARGET_WALLET}`"
             )
+        elif status == "CLOSED":
+            base_msg = (
+                f"❌ **TRADE CLOSED** ❌\n"
+                f"**Pair:** {pair_symbol}\n"
+                f"**Direction:** {direction_str}\n"
+                f"**Entry Price:** {open_price_val:,.2f}\n"
+                f"**Size:** {size_val:,.2f} USDC\n"
+                f"**Collateral:** {collateral_val:,.2f} USDC\n"
+                f"**Leverage:** {leverage_val:.2f}x\n"
+                f"**Wallet:** `{TARGET_WALLET}`"
+            )
+            
+            if close_details:
+                try:
+                    close_price = float(close_details.get('price', 0)) / 1e18
+                    
+                    # PnL Calculation: Amount Sent - Collateral
+                    amt_sent = float(close_details.get('amountSentToTrader', 0))
+                    hist_collateral = float(close_details.get('collateral', 0))
+                    
+                    pnl_val = (amt_sent - hist_collateral) / 1e6
+                    pnl_sign = "+" if pnl_val >= 0 else ""
+                    pnl_emoji = "✅" if pnl_val >= 0 else "❌"
+                    
+                    additional_info = (
+                        f"\n**Close Price:** {close_price:,.2f}\n"
+                        f"**PnL:** {pnl_emoji} {pnl_sign}{pnl_val:,.2f} USDC"
+                    )
+                    return base_msg + additional_info
+                except Exception as e:
+                    logger.error(f"Error formatting close details: {e}")
+            
+            return base_msg
+            
         return ""
     except Exception as e:
         logger.error(f"Error formatting trade: {e}")
@@ -247,9 +251,35 @@ async def poll_ostium(application: Application):
                 closed_uids = []
                 for uid, trade in known_trades.items():
                     if uid not in current_trades:
-                        # Use old trade data for the message
-                        msg = format_trade_message(trade, status="OPEN")
-                        msg = msg.replace("🟢 **OPEN POSITION**", "❌ **TRADE CLOSED** ❌")
+                        # Trade is CLOSED
+                        logger.info(f"Trade {uid} closed. Fetching history for details...")
+                        
+                        close_details = None
+                        try:
+                            # Fetch recent history to find the close details
+                            history = await sdk.subgraph.get_recent_history(TARGET_WALLET, last_n_orders=5)
+                            
+                            # Find the matching close order
+                            # We match by Pair ID and ensure it's a 'Close' action
+                            # We also check if it's recent (e.g. within last 5 minutes) to avoid stale matches
+                            # though polling is every 60s so it should be the top one.
+                            
+                            trade_pair_id = trade.get('pair', {}).get('id')
+                            
+                            for item in history:
+                                if (item.get('pair', {}).get('id') == trade_pair_id and 
+                                    item.get('orderAction') == 'Close'):
+                                    # Found a candidate.
+                                    # In a high frequency scenario we might need more checks (like index),
+                                    # but for this wallet/frequency, this should be sufficient.
+                                    close_details = item
+                                    break
+                                    
+                        except Exception as e:
+                            logger.error(f"Failed to fetch history for closed trade {uid}: {e}")
+
+                        # Format message with optional details
+                        msg = format_trade_message(trade, status="CLOSED", close_details=close_details)
                         await broadcast_message(application, msg)
                         closed_uids.append(uid)
                 
