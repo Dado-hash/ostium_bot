@@ -47,20 +47,27 @@ def save_subscribers(subscribers):
 subscribers = load_subscribers()
 
 # --- Ostium Helper ---
-async def get_current_trades_dict(sdk):
+async def get_current_trades_dict(sdk, retries=5):
     """Fetches open trades and returns a dict keyed by unique ID."""
-    try:
-        open_trades = await sdk.subgraph.get_open_trades(TARGET_WALLET)
-        current_trades = {}
-        for trade in open_trades:
-            pair_id = trade.get('pair', {}).get('id')
-            trade_index = trade.get('index')
-            unique_id = f"{pair_id}-{trade_index}"
-            current_trades[unique_id] = trade
-        return current_trades
-    except Exception as e:
-        logger.error(f"Failed to fetch trades: {e}")
-        return None  # Return None to indicate failure, not empty dict
+    for attempt in range(retries):
+        try:
+            open_trades = await sdk.subgraph.get_open_trades(TARGET_WALLET)
+            current_trades = {}
+            for trade in open_trades:
+                pair_id = trade.get('pair', {}).get('id')
+                trade_index = trade.get('index')
+                unique_id = f"{pair_id}-{trade_index}"
+                current_trades[unique_id] = trade
+            return current_trades
+        except Exception as e:
+            wait_time = min(2 ** attempt, 30)  # Exponential backoff: 1s, 2s, 4s, 8s, 16s (max 30s)
+            logger.warning(f"Failed to fetch trades (attempt {attempt+1}/{retries}): {type(e).__name__}")
+            if attempt < retries - 1:
+                logger.info(f"Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"All {retries} attempts failed. Subgraph may be down: {e}")
+                return None  # Return None to indicate failure, not empty dict
 
 def format_trade_message(trade, status="OPEN", close_details=None):
     """Formats a trade dict into a readable string."""
@@ -230,8 +237,8 @@ async def poll_ostium(application: Application):
             
             # Skip this cycle if fetch failed
             if current_trades is None:
-                logger.warning("Skipping this polling cycle due to fetch error")
-                await asyncio.sleep(60)
+                logger.warning("Subgraph unavailable. Will retry in 5 minutes.")
+                await asyncio.sleep(300)  # Wait 5 minutes when subgraph is down
                 continue
 
             if first_run:
