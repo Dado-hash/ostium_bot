@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import Forbidden
+from telegram.request import HTTPXRequest
 from ostium_python_sdk import OstiumSDK, NetworkConfig
 
 # Load environment variables
@@ -17,6 +18,10 @@ RPC_URL = os.getenv('RPC_URL')
 PRIVATE_KEY = os.getenv('PRIVATE_KEY')
 TARGET_WALLET = "0x7c930969fcf3e5a5c78bcf2e1cefda3f53e3c8fd"
 SUBSCRIBERS_FILE = "subscribers.json"
+# Optional: Set MESSAGE_THREAD_ID in .env to send to a specific topic in a group
+MESSAGE_THREAD_ID = os.getenv('MESSAGE_THREAD_ID')
+if MESSAGE_THREAD_ID:
+    MESSAGE_THREAD_ID = int(MESSAGE_THREAD_ID)
 
 # Logging setup
 logging.basicConfig(
@@ -24,6 +29,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Suppress verbose GraphQL introspection logs
+logging.getLogger('gql.transport.aiohttp').setLevel(logging.WARNING)
 
 if not all([TELEGRAM_BOT_TOKEN, RPC_URL, PRIVATE_KEY]):
     logger.error("Missing environment variables. Please check .env file.")
@@ -153,49 +161,80 @@ def format_trade_message(trade, status="OPEN", close_details=None):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Subscribe user to notifications and show current status."""
     chat_id = update.effective_chat.id
-    
+
+    # Prepare reply kwargs with optional thread_id
+    reply_kwargs = {"parse_mode": 'Markdown'}
+    if MESSAGE_THREAD_ID:
+        reply_kwargs["message_thread_id"] = MESSAGE_THREAD_ID
+
     # 1. Subscribe
     if chat_id not in subscribers:
         subscribers.add(chat_id)
         save_subscribers(subscribers)
-        await update.message.reply_text(f"✅ You are now subscribed to Ostium trade alerts for wallet `{TARGET_WALLET}`!", parse_mode='Markdown')
+        await update.message.reply_text(
+            f"✅ You are now subscribed to Ostium trade alerts for wallet `{TARGET_WALLET}`!",
+            **reply_kwargs
+        )
         logger.info(f"New subscriber: {chat_id}")
     else:
-        await update.message.reply_text("You are already subscribed. Checking for open positions...", parse_mode='Markdown')
+        await update.message.reply_text(
+            "You are already subscribed. Checking for open positions...",
+            **reply_kwargs
+        )
 
     # 2. Show current positions
-    # We need an SDK instance. Since we can't easily share the one from the loop, 
+    # We need an SDK instance. Since we can't easily share the one from the loop,
     # we'll create a temporary one or (better) use a global/shared one if possible.
     # For simplicity/robustness in this script, we'll create a quick instance.
     try:
         config = NetworkConfig.mainnet()
+        # Override the subgraph URL with the new Ormi endpoint
+        config.graph_url = "https://api.subgraph.ormilabs.com/api/public/67a599d5-c8d2-4cc4-9c4d-2975a97bc5d8/subgraphs/ost-prod/live/gn"
         sdk = OstiumSDK(config, PRIVATE_KEY, RPC_URL)
         trades = await get_current_trades_dict(sdk)
-        
+
         if trades is None:
-            await update.message.reply_text("⚠️ Could not fetch current positions at this moment. Will notify you of future trades.")
+            await update.message.reply_text(
+                "⚠️ Could not fetch current positions at this moment. Will notify you of future trades.",
+                **reply_kwargs
+            )
         elif not trades:
-            await update.message.reply_text("ℹ️ No open positions found for this wallet right now.")
+            await update.message.reply_text(
+                "ℹ️ No open positions found for this wallet right now.",
+                **reply_kwargs
+            )
         else:
-            await update.message.reply_text(f"📊 **Current Open Positions ({len(trades)}):**", parse_mode='Markdown')
+            await update.message.reply_text(
+                f"📊 **Current Open Positions ({len(trades)}):**",
+                **reply_kwargs
+            )
             for uid, trade in trades.items():
                 msg = format_trade_message(trade, status="OPEN")
-                await update.message.reply_text(msg, parse_mode='Markdown')
-                
+                await update.message.reply_text(msg, **reply_kwargs)
+
     except Exception as e:
         logger.error(f"Error fetching initial status for {chat_id}: {e}")
-        await update.message.reply_text("⚠️ Could not fetch current positions at this moment.")
+        await update.message.reply_text(
+            "⚠️ Could not fetch current positions at this moment.",
+            **reply_kwargs
+        )
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Unsubscribe user from notifications."""
     chat_id = update.effective_chat.id
+
+    # Prepare reply kwargs with optional thread_id
+    reply_kwargs = {"parse_mode": 'Markdown'}
+    if MESSAGE_THREAD_ID:
+        reply_kwargs["message_thread_id"] = MESSAGE_THREAD_ID
+
     if chat_id in subscribers:
         subscribers.remove(chat_id)
         save_subscribers(subscribers)
-        await update.message.reply_text("❌ You have unsubscribed from alerts.")
+        await update.message.reply_text("❌ You have unsubscribed from alerts.", **reply_kwargs)
         logger.info(f"Subscriber removed: {chat_id}")
     else:
-        await update.message.reply_text("You are not subscribed.")
+        await update.message.reply_text("You are not subscribed.", **reply_kwargs)
 
 async def broadcast_message(application: Application, message: str):
     """Sends a message to all subscribers."""
@@ -205,7 +244,11 @@ async def broadcast_message(application: Application, message: str):
     # Create a copy to iterate safely
     for chat_id in list(subscribers):
         try:
-            await application.bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+            # Include message_thread_id if configured (for sending to a specific topic in a group)
+            kwargs = {"chat_id": chat_id, "text": message, "parse_mode": 'Markdown'}
+            if MESSAGE_THREAD_ID:
+                kwargs["message_thread_id"] = MESSAGE_THREAD_ID
+            await application.bot.send_message(**kwargs)
         except Forbidden:
             # User blocked the bot
             logger.warning(f"User {chat_id} blocked the bot. Removing from subscribers.")
@@ -218,11 +261,13 @@ async def broadcast_message(application: Application, message: str):
 async def poll_ostium(application: Application):
     """Polls Ostium SDK for trade updates."""
     logger.info(f"Starting Ostium Monitor for {TARGET_WALLET}...")
-    
+
     try:
         config = NetworkConfig.mainnet()
+        # Override the subgraph URL with the new Ormi endpoint
+        config.graph_url = "https://api.subgraph.ormilabs.com/api/public/67a599d5-c8d2-4cc4-9c4d-2975a97bc5d8/subgraphs/ost-prod/live/gn"
         sdk = OstiumSDK(config, PRIVATE_KEY, RPC_URL)
-        logger.info("SDK Initialized.")
+        logger.info(f"SDK Initialized with Ormi subgraph: {config.graph_url}")
     except Exception as e:
         logger.error(f"Error initializing SDK: {e}")
         return
@@ -351,16 +396,42 @@ async def poll_ostium(application: Application):
 
 async def main():
     """Start the bot."""
-    # Create the Application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Create custom HTTPXRequest with increased timeouts
+    # Default timeout is often 5-10 seconds, we increase to 60 seconds
+    http_request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=30.0,  # 30 seconds for connection establishment
+        read_timeout=60.0,      # 60 seconds for reading response
+        write_timeout=30.0,     # 30 seconds for writing request
+        pool_timeout=10.0       # 10 seconds for acquiring connection from pool
+    )
+    
+    # Create the Application with custom request object
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(http_request).build()
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stop", stop))
 
-    # Initialize application
-    await application.initialize()
-    await application.start()
+    # Initialize application with retry logic
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing Telegram bot (attempt {attempt + 1}/{max_retries})...")
+            await application.initialize()
+            await application.start()
+            logger.info("✅ Telegram bot initialized successfully!")
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
+                logger.warning(f"Failed to initialize bot: {type(e).__name__}: {e}")
+                logger.info(f"Retrying in {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Failed to initialize bot after {max_retries} attempts. Exiting.")
+                raise
+    
     await application.updater.start_polling()
 
     # Run Ostium polling in the background
