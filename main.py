@@ -1,10 +1,12 @@
 import asyncio
 import os
+import json
 import logging
 from datetime import datetime, time
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Forbidden
 from telegram.request import HTTPXRequest
 from ostium_python_sdk import OstiumSDK, NetworkConfig
 
@@ -16,6 +18,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 RPC_URL = os.getenv('RPC_URL')
 PRIVATE_KEY = os.getenv('PRIVATE_KEY')
 TARGET_WALLET = "0x7c930969fcf3e5a5c78bcf2e1cefda3f53e3c8fd"
+SUBSCRIBERS_FILE = "subscribers.json"
 # Telegram Group Chat ID (the negative number from the group)
 TELEGRAM_GROUP_CHAT_ID = os.getenv('TELEGRAM_GROUP_CHAT_ID')
 if TELEGRAM_GROUP_CHAT_ID:
@@ -41,6 +44,23 @@ if not all([TELEGRAM_BOT_TOKEN, RPC_URL, PRIVATE_KEY, TELEGRAM_GROUP_CHAT_ID, ME
     logger.error("Missing environment variables. Please check .env file.")
     logger.error("Required: TELEGRAM_BOT_TOKEN, RPC_URL, PRIVATE_KEY, TELEGRAM_GROUP_CHAT_ID, MESSAGE_THREAD_ID")
     exit(1)
+
+# --- Persistence ---
+def load_subscribers():
+    if os.path.exists(SUBSCRIBERS_FILE):
+        try:
+            with open(SUBSCRIBERS_FILE, 'r') as f:
+                return set(json.load(f))
+        except json.JSONDecodeError:
+            return set()
+    return set()
+
+def save_subscribers(subscribers):
+    with open(SUBSCRIBERS_FILE, 'w') as f:
+        json.dump(list(subscribers), f)
+
+# Global set of subscribers
+subscribers = load_subscribers()
 
 # --- Fee Structure (in basis points - bps) ---
 # Based on Ostium's fee schedule
@@ -214,6 +234,51 @@ def format_trade_message(trade, status="OPEN", close_details=None):
         return f"Error formatting trade: {str(e)}"
 
 # --- Telegram Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Subscribe user to notifications and show current status."""
+    chat_id = update.effective_chat.id
+
+    # 1. Subscribe
+    if chat_id not in subscribers:
+        subscribers.add(chat_id)
+        save_subscribers(subscribers)
+        await update.message.reply_text(f"✅ You are now subscribed to Ostium trade alerts for wallet `{TARGET_WALLET}`!", parse_mode='Markdown')
+        logger.info(f"New subscriber: {chat_id}")
+    else:
+        await update.message.reply_text("You are already subscribed. Checking for open positions...", parse_mode='Markdown')
+
+    # 2. Show current positions
+    try:
+        config = NetworkConfig.mainnet()
+        config.graph_url = "https://api.subgraph.ormilabs.com/api/public/67a599d5-c8d2-4cc4-9c4d-2975a97bc5d8/subgraphs/ost-prod/live/gn"
+        sdk = OstiumSDK(config, PRIVATE_KEY, RPC_URL)
+        trades = await get_current_trades_dict(sdk)
+
+        if trades is None:
+            await update.message.reply_text("⚠️ Could not fetch current positions at this moment. Will notify you of future trades.")
+        elif not trades:
+            await update.message.reply_text("ℹ️ No open positions found for this wallet right now.")
+        else:
+            await update.message.reply_text(f"📊 **Current Open Positions ({len(trades)}):**", parse_mode='Markdown')
+            for uid, trade in trades.items():
+                msg = format_trade_message(trade, status="OPEN")
+                await update.message.reply_text(msg, parse_mode='Markdown')
+
+    except Exception as e:
+        logger.error(f"Error fetching initial status for {chat_id}: {e}")
+        await update.message.reply_text("⚠️ Could not fetch current positions at this moment.")
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unsubscribe user from notifications."""
+    chat_id = update.effective_chat.id
+    if chat_id in subscribers:
+        subscribers.remove(chat_id)
+        save_subscribers(subscribers)
+        await update.message.reply_text("❌ You have unsubscribed from alerts.")
+        logger.info(f"Subscriber removed: {chat_id}")
+    else:
+        await update.message.reply_text("You are not subscribed.")
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current open positions (command for manual check)."""
     try:
@@ -370,7 +435,8 @@ def format_daily_report(stats):
     return report
 
 async def broadcast_message(application: Application, message: str):
-    """Sends a message to the configured group and topic."""
+    """Sends a message to the configured group and all subscribed users."""
+    # 1. Send to group + topic
     try:
         kwargs = {
             "chat_id": TELEGRAM_GROUP_CHAT_ID,
@@ -383,6 +449,25 @@ async def broadcast_message(application: Application, message: str):
         await application.bot.send_message(**kwargs)
     except Exception as e:
         logger.error(f"Failed to send message to group: {e}")
+
+    # 2. Send to all subscribed private chats
+    if not subscribers:
+        return
+
+    for chat_id in list(subscribers):
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode='Markdown'
+            )
+        except Forbidden:
+            # User blocked the bot
+            logger.warning(f"User {chat_id} blocked the bot. Removing from subscribers.")
+            subscribers.remove(chat_id)
+            save_subscribers(subscribers)
+        except Exception as e:
+            logger.error(f"Failed to send message to {chat_id}: {e}")
 
 # --- Daily Report Scheduler ---
 async def daily_report_scheduler(application: Application):
@@ -591,6 +676,8 @@ async def main():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(http_request).build()
 
     # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stop", stop))
     application.add_handler(CommandHandler("status", status))
 
     # Initialize application with retry logic
