@@ -1,11 +1,9 @@
 import asyncio
 import os
-import json
 import logging
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import Forbidden
 from telegram.request import HTTPXRequest
 from ostium_python_sdk import OstiumSDK, NetworkConfig
 
@@ -17,8 +15,11 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 RPC_URL = os.getenv('RPC_URL')
 PRIVATE_KEY = os.getenv('PRIVATE_KEY')
 TARGET_WALLET = "0x7c930969fcf3e5a5c78bcf2e1cefda3f53e3c8fd"
-SUBSCRIBERS_FILE = "subscribers.json"
-# Optional: Set MESSAGE_THREAD_ID in .env to send to a specific topic in a group
+# Telegram Group Chat ID (the negative number from the group)
+TELEGRAM_GROUP_CHAT_ID = os.getenv('TELEGRAM_GROUP_CHAT_ID')
+if TELEGRAM_GROUP_CHAT_ID:
+    TELEGRAM_GROUP_CHAT_ID = int(TELEGRAM_GROUP_CHAT_ID)
+# Topic ID where to send messages (required if using topics)
 MESSAGE_THREAD_ID = os.getenv('MESSAGE_THREAD_ID')
 if MESSAGE_THREAD_ID:
     MESSAGE_THREAD_ID = int(MESSAGE_THREAD_ID)
@@ -33,26 +34,10 @@ logger = logging.getLogger(__name__)
 # Suppress verbose GraphQL introspection logs
 logging.getLogger('gql.transport.aiohttp').setLevel(logging.WARNING)
 
-if not all([TELEGRAM_BOT_TOKEN, RPC_URL, PRIVATE_KEY]):
+if not all([TELEGRAM_BOT_TOKEN, RPC_URL, PRIVATE_KEY, TELEGRAM_GROUP_CHAT_ID, MESSAGE_THREAD_ID]):
     logger.error("Missing environment variables. Please check .env file.")
+    logger.error("Required: TELEGRAM_BOT_TOKEN, RPC_URL, PRIVATE_KEY, TELEGRAM_GROUP_CHAT_ID, MESSAGE_THREAD_ID")
     exit(1)
-
-# --- Persistence ---
-def load_subscribers():
-    if os.path.exists(SUBSCRIBERS_FILE):
-        try:
-            with open(SUBSCRIBERS_FILE, 'r') as f:
-                return set(json.load(f))
-        except json.JSONDecodeError:
-            return set()
-    return set()
-
-def save_subscribers(subscribers):
-    with open(SUBSCRIBERS_FILE, 'w') as f:
-        json.dump(list(subscribers), f)
-
-# Global set of subscribers
-subscribers = load_subscribers()
 
 # --- Ostium Helper ---
 async def get_current_trades_dict(sdk, retries=5):
@@ -119,8 +104,23 @@ def format_trade_message(trade, status="OPEN", close_details=None):
                 f"**Wallet:** `{TARGET_WALLET}`"
             )
         elif status == "CLOSED":
+            # Check if this is a liquidation (no close details or no price)
+            is_liquidation = False
+            if not close_details:
+                is_liquidation = True
+            else:
+                try:
+                    close_price = float(close_details.get('price', 0))
+                    if close_price == 0:
+                        is_liquidation = True
+                except:
+                    is_liquidation = True
+
+            # Set title based on liquidation status
+            title = "💀 **LIQUIDATED** 💀" if is_liquidation else "❌ **TRADE CLOSED** ❌"
+
             base_msg = (
-                f"❌ **TRADE CLOSED** ❌\n"
+                f"{title}\n"
                 f"**Pair:** {pair_symbol}\n"
                 f"**Direction:** {direction_str}\n"
                 f"**Entry Price:** {open_price_val:,.2f}\n"
@@ -129,27 +129,28 @@ def format_trade_message(trade, status="OPEN", close_details=None):
                 f"**Leverage:** {leverage_val:.2f}x\n"
                 f"**Wallet:** `{TARGET_WALLET}`"
             )
-            
-            if close_details:
+
+            # Add close details only if not liquidated
+            if close_details and not is_liquidation:
                 try:
-                    close_price = float(close_details.get('price', 0)) / 1e18
-                    
+                    close_price_val = float(close_details.get('price', 0)) / 1e18
+
                     # PnL Calculation: Amount Sent - Collateral
                     amt_sent = float(close_details.get('amountSentToTrader', 0))
                     hist_collateral = float(close_details.get('collateral', 0))
-                    
+
                     pnl_val = (amt_sent - hist_collateral) / 1e6
                     pnl_sign = "+" if pnl_val >= 0 else ""
                     pnl_emoji = "✅" if pnl_val >= 0 else "❌"
-                    
+
                     additional_info = (
-                        f"\n**Close Price:** {close_price:,.2f}\n"
+                        f"\n**Close Price:** {close_price_val:,.2f}\n"
                         f"**PnL:** {pnl_emoji} {pnl_sign}{pnl_val:,.2f} USDC"
                     )
                     return base_msg + additional_info
                 except Exception as e:
                     logger.error(f"Error formatting close details: {e}")
-            
+
             return base_msg
             
         return ""
@@ -158,104 +159,41 @@ def format_trade_message(trade, status="OPEN", close_details=None):
         return f"Error formatting trade: {str(e)}"
 
 # --- Telegram Handlers ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Subscribe user to notifications and show current status."""
-    chat_id = update.effective_chat.id
-
-    # Prepare reply kwargs with optional thread_id
-    reply_kwargs = {"parse_mode": 'Markdown'}
-    if MESSAGE_THREAD_ID:
-        reply_kwargs["message_thread_id"] = MESSAGE_THREAD_ID
-
-    # 1. Subscribe
-    if chat_id not in subscribers:
-        subscribers.add(chat_id)
-        save_subscribers(subscribers)
-        await update.message.reply_text(
-            f"✅ You are now subscribed to Ostium trade alerts for wallet `{TARGET_WALLET}`!",
-            **reply_kwargs
-        )
-        logger.info(f"New subscriber: {chat_id}")
-    else:
-        await update.message.reply_text(
-            "You are already subscribed. Checking for open positions...",
-            **reply_kwargs
-        )
-
-    # 2. Show current positions
-    # We need an SDK instance. Since we can't easily share the one from the loop,
-    # we'll create a temporary one or (better) use a global/shared one if possible.
-    # For simplicity/robustness in this script, we'll create a quick instance.
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current open positions (command for manual check)."""
     try:
         config = NetworkConfig.mainnet()
-        # Override the subgraph URL with the new Ormi endpoint
         config.graph_url = "https://api.subgraph.ormilabs.com/api/public/67a599d5-c8d2-4cc4-9c4d-2975a97bc5d8/subgraphs/ost-prod/live/gn"
         sdk = OstiumSDK(config, PRIVATE_KEY, RPC_URL)
         trades = await get_current_trades_dict(sdk)
 
         if trades is None:
-            await update.message.reply_text(
-                "⚠️ Could not fetch current positions at this moment. Will notify you of future trades.",
-                **reply_kwargs
-            )
+            await update.message.reply_text("⚠️ Could not fetch positions.", parse_mode='Markdown')
         elif not trades:
-            await update.message.reply_text(
-                "ℹ️ No open positions found for this wallet right now.",
-                **reply_kwargs
-            )
+            await update.message.reply_text("ℹ️ No open positions.", parse_mode='Markdown')
         else:
-            await update.message.reply_text(
-                f"📊 **Current Open Positions ({len(trades)}):**",
-                **reply_kwargs
-            )
+            await update.message.reply_text(f"📊 **Current Open Positions ({len(trades)}):**", parse_mode='Markdown')
             for uid, trade in trades.items():
                 msg = format_trade_message(trade, status="OPEN")
-                await update.message.reply_text(msg, **reply_kwargs)
-
+                await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
-        logger.error(f"Error fetching initial status for {chat_id}: {e}")
-        await update.message.reply_text(
-            "⚠️ Could not fetch current positions at this moment.",
-            **reply_kwargs
-        )
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Unsubscribe user from notifications."""
-    chat_id = update.effective_chat.id
-
-    # Prepare reply kwargs with optional thread_id
-    reply_kwargs = {"parse_mode": 'Markdown'}
-    if MESSAGE_THREAD_ID:
-        reply_kwargs["message_thread_id"] = MESSAGE_THREAD_ID
-
-    if chat_id in subscribers:
-        subscribers.remove(chat_id)
-        save_subscribers(subscribers)
-        await update.message.reply_text("❌ You have unsubscribed from alerts.", **reply_kwargs)
-        logger.info(f"Subscriber removed: {chat_id}")
-    else:
-        await update.message.reply_text("You are not subscribed.", **reply_kwargs)
+        logger.error(f"Error fetching status: {e}")
+        await update.message.reply_text("⚠️ Error fetching positions.", parse_mode='Markdown')
 
 async def broadcast_message(application: Application, message: str):
-    """Sends a message to all subscribers."""
-    if not subscribers:
-        return
+    """Sends a message to the configured group and topic."""
+    try:
+        kwargs = {
+            "chat_id": TELEGRAM_GROUP_CHAT_ID,
+            "text": message,
+            "parse_mode": 'Markdown'
+        }
+        if MESSAGE_THREAD_ID:
+            kwargs["message_thread_id"] = MESSAGE_THREAD_ID
 
-    # Create a copy to iterate safely
-    for chat_id in list(subscribers):
-        try:
-            # Include message_thread_id if configured (for sending to a specific topic in a group)
-            kwargs = {"chat_id": chat_id, "text": message, "parse_mode": 'Markdown'}
-            if MESSAGE_THREAD_ID:
-                kwargs["message_thread_id"] = MESSAGE_THREAD_ID
-            await application.bot.send_message(**kwargs)
-        except Forbidden:
-            # User blocked the bot
-            logger.warning(f"User {chat_id} blocked the bot. Removing from subscribers.")
-            subscribers.remove(chat_id)
-            save_subscribers(subscribers)
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+        await application.bot.send_message(**kwargs)
+    except Exception as e:
+        logger.error(f"Failed to send message to group: {e}")
 
 # --- Ostium Polling Task ---
 async def poll_ostium(application: Application):
@@ -410,8 +348,7 @@ async def main():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(http_request).build()
 
     # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stop", stop))
+    application.add_handler(CommandHandler("status", status))
 
     # Initialize application with retry logic
     max_retries = 3
