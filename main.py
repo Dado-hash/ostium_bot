@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+from datetime import datetime, time
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -23,6 +24,8 @@ if TELEGRAM_GROUP_CHAT_ID:
 MESSAGE_THREAD_ID = os.getenv('MESSAGE_THREAD_ID')
 if MESSAGE_THREAD_ID:
     MESSAGE_THREAD_ID = int(MESSAGE_THREAD_ID)
+# Daily report time (format: HH:MM in 24h format, default 09:00)
+DAILY_REPORT_TIME = os.getenv('DAILY_REPORT_TIME', '09:00')
 
 # Logging setup
 logging.basicConfig(
@@ -38,6 +41,42 @@ if not all([TELEGRAM_BOT_TOKEN, RPC_URL, PRIVATE_KEY, TELEGRAM_GROUP_CHAT_ID, ME
     logger.error("Missing environment variables. Please check .env file.")
     logger.error("Required: TELEGRAM_BOT_TOKEN, RPC_URL, PRIVATE_KEY, TELEGRAM_GROUP_CHAT_ID, MESSAGE_THREAD_ID")
     exit(1)
+
+# --- Fee Structure (in basis points - bps) ---
+# Based on Ostium's fee schedule
+OPENING_FEES = {
+    # Commodities
+    'XAU/USD': 3,   # Gold
+    'CL/USD': 10,   # Oil
+    'HG/USD': 15,   # Copper
+    'XAG/USD': 15,  # Silver
+    'XPT/USD': 20,  # Platinum
+    'XPD/USD': 20,  # Palladium
+    # Forex
+    'USD/MXN': 5,   # Exception
+    # Default rates by asset class (will be applied if specific pair not found)
+    '_CRYPTO_': 10,  # Taker fee for crypto
+    '_INDICES_': 5,  # Taker fee for indices
+    '_FOREX_': 3,    # Taker fee for forex
+    '_STOCKS_': 5,   # Taker fee for stocks
+}
+
+def get_opening_fee_bps(pair_symbol):
+    """Returns the opening fee in basis points for a given pair."""
+    # Check if specific pair has a fee
+    if pair_symbol in OPENING_FEES:
+        return OPENING_FEES[pair_symbol]
+
+    # Default to crypto rate (most common, highest fee)
+    # In production, you'd classify the pair by asset class
+    return OPENING_FEES['_CRYPTO_']
+
+def calculate_opening_fee(notional_usdc, pair_symbol):
+    """Calculate opening fee in USDC based on notional value and pair."""
+    fee_bps = get_opening_fee_bps(pair_symbol)
+    # 1 bps = 0.01%
+    fee_usdc = (notional_usdc * fee_bps) / 10000
+    return fee_usdc
 
 # --- Ostium Helper ---
 async def get_current_trades_dict(sdk, retries=5):
@@ -92,8 +131,11 @@ def format_trade_message(trade, status="OPEN", close_details=None):
         is_long = trade.get('isBuy', True) # 'isBuy' from raw data
         direction_str = "LONG 🟢" if is_long else "SHORT 🔴"
 
+        # Calculate opening fee based on Ostium's fee structure
+        opening_fee = calculate_opening_fee(size_val, pair_symbol)
+
         if status == "OPEN":
-            return (
+            msg = (
                 f"🟢 **OPEN POSITION**\n"
                 f"**Pair:** {pair_symbol}\n"
                 f"**Direction:** {direction_str}\n"
@@ -101,8 +143,10 @@ def format_trade_message(trade, status="OPEN", close_details=None):
                 f"**Size:** {size_val:,.2f} USDC\n"
                 f"**Collateral:** {collateral_val:,.2f} USDC\n"
                 f"**Leverage:** {leverage_val:.2f}x\n"
+                f"**Opening Fee:** {opening_fee:,.2f} USDC\n"
                 f"**Wallet:** `{TARGET_WALLET}`"
             )
+            return msg
         elif status == "CLOSED":
             # Check if this is a liquidation (no close details or no price)
             is_liquidation = False
@@ -143,10 +187,21 @@ def format_trade_message(trade, status="OPEN", close_details=None):
                     pnl_sign = "+" if pnl_val >= 0 else ""
                     pnl_emoji = "✅" if pnl_val >= 0 else "❌"
 
-                    additional_info = (
-                        f"\n**Close Price:** {close_price_val:,.2f}\n"
-                        f"**PnL:** {pnl_emoji} {pnl_sign}{pnl_val:,.2f} USDC"
-                    )
+                    # Extract funding fees (rollover + funding) from close details
+                    # These are in wei (18 decimals)
+                    rollover_fee = float(close_details.get('rolloverFee', 0)) / 1e18
+                    funding_fee = float(close_details.get('fundingFee', 0)) / 1e18
+                    total_funding = rollover_fee + funding_fee
+
+                    additional_info = f"\n**Close Price:** {close_price_val:,.2f}\n"
+                    additional_info += f"**Opening Fee:** {opening_fee:,.2f} USDC\n"
+
+                    # Show funding fees if significant (> $0.01)
+                    if total_funding > 0.01:
+                        additional_info += f"**Funding Paid:** {total_funding:,.2f} USDC\n"
+
+                    additional_info += f"**PnL:** {pnl_emoji} {pnl_sign}{pnl_val:,.2f} USDC"
+
                     return base_msg + additional_info
                 except Exception as e:
                     logger.error(f"Error formatting close details: {e}")
@@ -180,6 +235,140 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error fetching status: {e}")
         await update.message.reply_text("⚠️ Error fetching positions.", parse_mode='Markdown')
 
+async def get_current_price(sdk, pair_id):
+    """Gets current market price for a pair."""
+    try:
+        # Get pair details which should include current price
+        pair_details = await sdk.subgraph.get_pair_details(pair_id)
+        # The price might be in different fields, we'll try common ones
+        # For now return None, will need to check actual structure
+        return None
+    except Exception as e:
+        logger.error(f"Error getting current price for pair {pair_id}: {e}")
+        return None
+
+async def calculate_unrealized_pnl(trade, current_price):
+    """Calculate unrealized PNL for a single trade."""
+    try:
+        is_long = trade.get('isBuy', True)
+        open_price = float(trade.get('openPrice', 0)) / 1e18
+        notional = float(trade.get('notional', 0)) / 1e6
+        collateral = float(trade.get('collateral', 0)) / 1e6
+
+        if not current_price or open_price == 0:
+            return 0.0
+
+        # Calculate PNL based on price change
+        # For LONG: PNL = (current_price - open_price) / open_price * notional
+        # For SHORT: PNL = (open_price - current_price) / open_price * notional
+        price_change_ratio = (current_price - open_price) / open_price if is_long else (open_price - current_price) / open_price
+        pnl = price_change_ratio * notional
+
+        return pnl
+    except Exception as e:
+        logger.error(f"Error calculating unrealized PNL: {e}")
+        return 0.0
+
+async def get_account_stats(sdk):
+    """Fetches account statistics for daily report."""
+    try:
+        # Get open trades
+        open_trades = await sdk.subgraph.get_open_trades(TARGET_WALLET)
+
+        # Calculate unrealized PNL and total position value
+        unrealized_pnl = 0.0
+        total_position_value = 0.0
+        positions_details = []
+
+        for trade in open_trades:
+            # Extract trade details
+            pair_from = trade.get('pair', {}).get('from', 'Unknown')
+            pair_to = trade.get('pair', {}).get('to', 'USD')
+            pair_symbol = f"{pair_from}/{pair_to}"
+
+            is_long = trade.get('isBuy', True)
+            direction = "LONG" if is_long else "SHORT"
+            direction_emoji = "🟢" if is_long else "🔴"
+
+            leverage_raw = float(trade.get('leverage', 0))
+            leverage = leverage_raw / 100
+
+            notional = float(trade.get('notional', 0)) / 1e6
+            total_position_value += notional
+
+            # Try to get current price and calculate PNL
+            pair_id = trade.get('pair', {}).get('id')
+            pnl = 0.0
+            if pair_id:
+                current_price = await get_current_price(sdk, pair_id)
+                pnl = await calculate_unrealized_pnl(trade, current_price)
+                unrealized_pnl += pnl
+
+            # Store position details
+            positions_details.append({
+                'pair': pair_symbol,
+                'direction': direction,
+                'direction_emoji': direction_emoji,
+                'leverage': leverage,
+                'size': notional,
+                'pnl': pnl
+            })
+
+        return {
+            'unrealized_pnl': unrealized_pnl,
+            'total_position_value': total_position_value,
+            'open_positions': len(open_trades),
+            'positions': positions_details
+        }
+    except Exception as e:
+        logger.error(f"Error fetching account stats: {e}")
+        return None
+
+def format_daily_report(stats):
+    """Formats account statistics into a daily report message."""
+    if not stats:
+        return "⚠️ Could not generate daily report at this time."
+
+    # Format numbers with proper signs and emojis
+    unrealized_pnl = stats['unrealized_pnl']
+    unrealized_sign = "+" if unrealized_pnl >= 0 else ""
+    unrealized_emoji = "📈" if unrealized_pnl >= 0 else "📉"
+
+    report = (
+        f"📊 **DAILY ACCOUNT REPORT** 📊\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{unrealized_emoji} **Total Unrealized PNL:** {unrealized_sign}{unrealized_pnl:,.2f} USDC\n"
+        f"💼 **Total Position Value:** {stats['total_position_value']:,.2f} USDC\n"
+        f"📍 **Open Positions:** {stats['open_positions']}\n"
+    )
+
+    # Add individual positions if available
+    positions = stats.get('positions', [])
+    if positions:
+        report += f"\n**Open Positions:**\n"
+        for idx, pos in enumerate(positions, 1):
+            pnl_sign = "+" if pos['pnl'] >= 0 else ""
+            pnl_emoji = "✅" if pos['pnl'] >= 0 else "❌"
+
+            report += (
+                f"{idx}️⃣ **{pos['pair']}** {pos['direction']} {pos['direction_emoji']} "
+                f"{pos['leverage']:.0f}x - "
+                f"Size: {pos['size']:,.2f} USDC"
+            )
+
+            # Show PNL if calculated (not zero)
+            if abs(pos['pnl']) > 0.01:
+                report += f" - PNL: {pnl_emoji} {pnl_sign}{pos['pnl']:,.2f} USDC"
+
+            report += "\n"
+
+    report += (
+        f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"**Wallet:** `{TARGET_WALLET}`"
+    )
+
+    return report
+
 async def broadcast_message(application: Application, message: str):
     """Sends a message to the configured group and topic."""
     try:
@@ -194,6 +383,60 @@ async def broadcast_message(application: Application, message: str):
         await application.bot.send_message(**kwargs)
     except Exception as e:
         logger.error(f"Failed to send message to group: {e}")
+
+# --- Daily Report Scheduler ---
+async def daily_report_scheduler(application: Application):
+    """Sends daily account report at configured time."""
+    logger.info(f"Starting Daily Report Scheduler (Report time: {DAILY_REPORT_TIME})...")
+
+    # Parse the configured time
+    try:
+        hour, minute = map(int, DAILY_REPORT_TIME.split(':'))
+        target_time = time(hour, minute)
+    except Exception as e:
+        logger.error(f"Invalid DAILY_REPORT_TIME format: {DAILY_REPORT_TIME}. Using default 09:00")
+        target_time = time(9, 0)
+
+    # Initialize SDK for daily reports
+    try:
+        config = NetworkConfig.mainnet()
+        config.graph_url = "https://api.subgraph.ormilabs.com/api/public/67a599d5-c8d2-4cc4-9c4d-2975a97bc5d8/subgraphs/ost-prod/live/gn"
+        sdk = OstiumSDK(config, PRIVATE_KEY, RPC_URL)
+    except Exception as e:
+        logger.error(f"Error initializing SDK for daily reports: {e}")
+        return
+
+    last_report_date = None
+
+    while True:
+        try:
+            now = datetime.now()
+            current_time = now.time()
+            current_date = now.date()
+
+            # Check if it's time to send the report and we haven't sent it today
+            if (current_time.hour == target_time.hour and
+                current_time.minute == target_time.minute and
+                last_report_date != current_date):
+
+                logger.info("Generating daily account report...")
+
+                # Get account stats
+                stats = await get_account_stats(sdk)
+
+                # Format and send report
+                report = format_daily_report(stats)
+                await broadcast_message(application, report)
+
+                logger.info("Daily report sent successfully!")
+                last_report_date = current_date
+
+            # Sleep for 60 seconds before checking again
+            await asyncio.sleep(60)
+
+        except Exception as e:
+            logger.error(f"Error in daily report scheduler: {e}")
+            await asyncio.sleep(60)
 
 # --- Ostium Polling Task ---
 async def poll_ostium(application: Application):
@@ -371,15 +614,16 @@ async def main():
     
     await application.updater.start_polling()
 
-    # Run Ostium polling in the background
-    # We create a task for the polling loop
+    # Run background tasks
     polling_task = asyncio.create_task(poll_ostium(application))
+    daily_report_task = asyncio.create_task(daily_report_scheduler(application))
+
+    logger.info("All background tasks started successfully!")
 
     # Keep the main loop running
-    # In a production environment, you might want better signal handling
     try:
-        # Wait for the polling task (which runs forever)
-        await polling_task
+        # Wait for all tasks (which run forever)
+        await asyncio.gather(polling_task, daily_report_task)
     except asyncio.CancelledError:
         logger.info("Stopping bot...")
     finally:
